@@ -8,7 +8,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 SSH_DROPIN="/etc/ssh/sshd_config.d/99-hardening.conf"
 SSH_BACKUP_DIR="/root/init-prod-backups"
 mkdir -p "$SSH_BACKUP_DIR"
@@ -96,6 +96,40 @@ summary_line() {
   printf "  %-28s %s\n" "$1" "$2"
 }
 
+get_user_home() {
+  getent passwd "$1" | cut -d: -f6
+}
+
+detect_ssh_port() {
+  local ssh_port
+  ssh_port="$(ss -tlnp 2>/dev/null | awk '/sshd/ {gsub(".*:","",$4); print $4}' | head -n1 || true)"
+  echo "${ssh_port:-22}"
+}
+
+get_local_ip_list() {
+  local ip_list
+  ip_list="$(hostname -I 2>/dev/null | xargs || true)"
+  echo "${ip_list:-未获取到}"
+}
+
+get_public_ip() {
+  local public_ip
+  public_ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)"
+  echo "$public_ip"
+}
+
+refresh_access_hints() {
+  LOCAL_IP_LIST="$(get_local_ip_list)"
+  PUBLIC_IP="$(get_public_ip)"
+  SSH_PORT_HINT="$(detect_ssh_port)"
+
+  if [[ -n "$PUBLIC_IP" ]]; then
+    SSH_CONNECT_TARGET="$PUBLIC_IP"
+  else
+    SSH_CONNECT_TARGET="$(echo "$LOCAL_IP_LIST" | awk '{print $1}')"
+  fi
+}
+
 install_base_packages() {
   log "刷新软件包索引..."
   apt update
@@ -153,6 +187,7 @@ set_hostname_interactive() {
 create_admin_user_interactive() {
   NEW_ADMIN_USER=""
   ADMIN_KEY_ADDED="no"
+  ADMIN_PASSWORD_SET="no"
 
   if ! ask_yes_no "是否创建新的运维用户并加入 sudo 组？" "y"; then
     warn "你选择了不创建新用户。后续 SSH 加固步骤会自动跳过。"
@@ -178,6 +213,14 @@ create_admin_user_interactive() {
     ok "用户已创建。"
   fi
 
+  if ask_yes_no "是否现在为 ${NEW_ADMIN_USER} 设置登录密码？" "y"; then
+    passwd "$NEW_ADMIN_USER"
+    ADMIN_PASSWORD_SET="yes"
+    ok "已为 ${NEW_ADMIN_USER} 设置密码。"
+  else
+    warn "你跳过了 ${NEW_ADMIN_USER} 的密码设置。若没有 SSH 公钥，后续将无法直接登录。"
+  fi
+
   if getent group sudo >/dev/null 2>&1; then
     adduser "$NEW_ADMIN_USER" sudo >/dev/null
     ok "已将 $NEW_ADMIN_USER 加入 sudo 组。"
@@ -189,33 +232,16 @@ create_admin_user_interactive() {
     ok "已将 $NEW_ADMIN_USER 加入 sudo 组。"
   fi
 
-  local ssh_dir auth_file
-  ssh_dir="/home/${NEW_ADMIN_USER}/.ssh"
-  auth_file="${ssh_dir}/authorized_keys"
-  mkdir -p "$ssh_dir"
-  chmod 700 "$ssh_dir"
-  touch "$auth_file"
-  chmod 600 "$auth_file"
-  chown -R "${NEW_ADMIN_USER}:${NEW_ADMIN_USER}" "$ssh_dir"
+  local user_home auth_file
+  user_home="$(get_user_home "$NEW_ADMIN_USER")"
+  auth_file="${user_home}/.ssh/authorized_keys"
 
-  if ask_yes_no "是否现在为 ${NEW_ADMIN_USER} 写入 SSH 公钥？" "y"; then
-    echo
-    echo "请粘贴一整行 SSH 公钥，例如 ssh-ed25519 ... 或 ssh-rsa ..."
-    echo "粘贴完成后回车。若暂时没有，直接回车跳过。"
-    local pubkey
-    read -r pubkey || true
-    if [[ -n "${pubkey}" ]]; then
-      if grep -qxF "${pubkey}" "$auth_file"; then
-        warn "该公钥已存在，跳过重复写入。"
-      else
-        echo "$pubkey" >> "$auth_file"
-        chown "${NEW_ADMIN_USER}:${NEW_ADMIN_USER}" "$auth_file"
-        ADMIN_KEY_ADDED="yes"
-        ok "SSH 公钥已写入 ${auth_file}"
-      fi
-    else
-      warn "你没有输入公钥，后续不会启用禁止密码登录。"
-    fi
+  if [[ -s "$auth_file" ]]; then
+    ADMIN_KEY_ADDED="yes"
+    ok "检测到 ${NEW_ADMIN_USER} 已存在 SSH 公钥: ${auth_file}"
+  else
+    warn "当前没有检测到 ${NEW_ADMIN_USER} 的 SSH 公钥。"
+    warn "脚本不会在服务器上替你写 authorized_keys，请在本地电脑执行 ssh-copy-id。"
   fi
 }
 
@@ -229,7 +255,7 @@ configure_ssh_hardening_staged() {
   fi
 
   if [[ "${ADMIN_KEY_ADDED:-no}" != "yes" ]]; then
-    warn "没有为 ${NEW_ADMIN_USER} 导入 SSH 公钥。为避免锁在服务器外面，跳过 SSH 禁密和禁 root。"
+    warn "没有检测到 ${NEW_ADMIN_USER} 的 SSH 公钥。为避免锁在服务器外面，跳过 SSH 禁密和禁 root。"
     return 0
   fi
 
@@ -272,8 +298,7 @@ setup_ufw() {
   fi
 
   local ssh_port web_http web_https extra_ports
-  ssh_port="$(ss -tlnp 2>/dev/null | awk '/sshd/ {gsub(".*:","",$4); print $4}' | head -n1 || true)"
-  ssh_port="${ssh_port:-22}"
+  ssh_port="$(detect_ssh_port)"
 
   log "将默认允许出站，默认拒绝入站。"
   ufw --force reset
@@ -398,10 +423,14 @@ EOF
 show_final_summary() {
   echo
   echo "==================== 执行摘要 ===================="
+  summary_line "本机地址 (hostname -I)" "${LOCAL_IP_LIST:-未获取到}"
+  summary_line "公网地址 (ipify)" "${PUBLIC_IP:-未获取到}"
+  summary_line "SSH 端口" "${SSH_PORT_HINT:-22}"
   summary_line "系统" "$(grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2- | tr -d '"')"
   summary_line "当前 hostname" "$(hostnamectl --static 2>/dev/null || hostname)"
   summary_line "新运维用户" "${NEW_ADMIN_USER:-未创建}"
-  summary_line "SSH 公钥已写入" "${ADMIN_KEY_ADDED:-no}"
+  summary_line "运维用户密码已设置" "${ADMIN_PASSWORD_SET:-no}"
+  summary_line "SSH 公钥已检测到" "${ADMIN_KEY_ADDED:-no}"
   summary_line "SSH 加固配置已暂存" "${SSH_STAGED:-no}"
   summary_line "SSH 可安全 reload" "${SSH_READY_TO_APPLY:-no}"
   echo "================================================="
@@ -409,36 +438,55 @@ show_final_summary() {
 }
 
 show_next_steps() {
-  local current_host ip_guess
+  local current_host ssh_target step
   current_host="$(hostnamectl --static 2>/dev/null || hostname)"
-  ip_guess="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  ssh_target="${SSH_CONNECT_TARGET:-$current_host}"
+  step=1
 
   echo "下一步建议按这个顺序执行："
   echo
-  if [[ -n "${NEW_ADMIN_USER:-}" && "${ADMIN_KEY_ADDED:-no}" == "yes" ]]; then
-    echo "1) 先在你本地电脑开一个新终端，测试新用户能否登录："
-    echo "   ssh ${NEW_ADMIN_USER}@${ip_guess:-<服务器IP>}"
+  if [[ -n "${NEW_ADMIN_USER:-}" && "${ADMIN_KEY_ADDED:-no}" != "yes" ]]; then
+    echo "${step}) 先在你本地电脑执行 ssh-copy-id，把本地公钥追加到远端用户："
+    echo "   ssh-copy-id -i ~/.ssh/id_ed25519.pub -p ${SSH_PORT_HINT:-22} ${NEW_ADMIN_USER}@${ssh_target}"
+    echo "   如果你走内网登录，把 ${ssh_target} 换成上面显示的本机地址即可。"
     echo
-    echo "2) 登录成功后，测试 sudo："
+    step=$((step + 1))
+    echo "${step}) 公钥追加完成后，在你本地电脑测试新用户登录："
+    echo "   ssh -p ${SSH_PORT_HINT:-22} ${NEW_ADMIN_USER}@${ssh_target}"
+    echo
+    step=$((step + 1))
+    echo "${step}) 登录成功后，测试 sudo："
+    echo "   sudo -i"
+    echo
+  elif [[ -n "${NEW_ADMIN_USER:-}" ]]; then
+    echo "${step}) 先在你本地电脑开一个新终端，测试新用户能否登录："
+    echo "   ssh -p ${SSH_PORT_HINT:-22} ${NEW_ADMIN_USER}@${ssh_target}"
+    echo
+    step=$((step + 1))
+    echo "${step}) 登录成功后，测试 sudo："
     echo "   sudo -i"
     echo
   else
-    echo "1) 你这次没有完成“新用户 + SSH 公钥”这一步。"
+    echo "${step}) 你这次没有完成“新用户 + SSH 公钥”这一步。"
     echo "   所以脚本没有帮你启用禁 root 和禁密码登录。"
     echo
   fi
 
   if [[ "${SSH_READY_TO_APPLY:-no}" == "yes" ]]; then
-    echo "3) 确认新用户登录和 sudo 都没问题后，再在当前会话里执行："
+    step=$((step + 1))
+    echo "${step}) 确认新用户登录和 sudo 都没问题后，再在当前会话里执行："
     echo "   sshd -t && systemctl reload ssh"
     echo
-    echo "4) reload 成功后，再新开一个终端重新测试一次："
-    echo "   ssh ${NEW_ADMIN_USER}@${ip_guess:-<服务器IP>}"
+    step=$((step + 1))
+    echo "${step}) reload 成功后，再新开一个终端重新测试一次："
+    echo "   ssh -p ${SSH_PORT_HINT:-22} ${NEW_ADMIN_USER}@${ssh_target}"
     echo
-    echo "5) 确认完全没问题后，你的 root SSH 登录和密码登录就已经被禁用了。"
+    step=$((step + 1))
+    echo "${step}) 确认完全没问题后，你的 root SSH 登录和密码登录就已经被禁用了。"
     echo
   else
-    echo "3) 当前没有待应用的 SSH 加固配置，或者还不满足安全启用条件。"
+    step=$((step + 1))
+    echo "${step}) 当前没有待应用的 SSH 加固配置，或者还不满足安全启用条件。"
     echo
   fi
 
@@ -471,6 +519,7 @@ main() {
   setup_unattended_upgrades
   install_docker_official_repo
 
+  refresh_access_hints
   show_final_summary
   show_next_steps
 }
